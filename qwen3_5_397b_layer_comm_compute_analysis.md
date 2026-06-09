@@ -1064,11 +1064,14 @@ all2all 拆成 EP 与 SP 分别看：
 
 注：用户给出的 all2all 总数为 `1297ms(memcpy 231ms)`，EP/SP 拆分相加为 `1290ms(memcpy 237ms)`，存在少量 profiling 分类或四舍五入口径差异。下面的归因分析按 EP/SP 拆分项判断瓶颈。
 
-通信合计按 FSDP + EP all2all + SP all2all 拆分：
+注意：FSDP、EP all2all、SP all2all 的 profiler 事件可以分项分析，但不能把它们的 wall time 直接累加为 E2E 通信耗时。FSDP 基本可以和计算 overlap，而 all2all 进入关键路径，因此 E2E 应按 overlap 口径计算：
 
-| 项目 | 理论耗时 | 实际 memcpy | 实际 wall time | memcpy / 理论 | wall / 理论 | wall / memcpy | 等待/调度耗时 | 等待占 wall |
-|---|---:|---:|---:|---:|---:|---:|---:|---:|
-| FSDP + EP all2all + SP all2all，12 层 | 323.6 ms | 542 ms | 3793 ms | 1.68x | 11.72x | 7.00x | 3251 ms | 85.7% |
+| 项目 | 实测耗时 | 进入 E2E 的方式 |
+|---|---:|---|
+| FSDP 参数通信，12 层 | 2503 ms | 与计算 overlap，作为 `max()` 的一侧 |
+| all2all 总 wall，12 层 | 1297 ms | 与计算串行，进入 `compute + all2all` |
+| 计算，12 层 | 1102 ms | 与 all2all 串行，进入 `compute + all2all` |
+| E2E overlap 估算 | 2503 ms | `max(2503, 1102 + 1297)` |
 
 计算部分：
 
@@ -1095,7 +1098,7 @@ T_e2e_12 = max(T_fsdp, T_compute + T_all2all)
          = 2503ms
 ```
 
-6. 通信合计 wall time 相比 memcpy 是 `7.00x`，额外 `3251ms` 主要来自等待/同步；但这些等待不应全部与计算串行相加，需要按上述 overlap 公式进入 E2E。
+6. 不应再使用 `FSDP + EP all2all + SP all2all` 的 wall time 累加值来解释端到端耗时；该累加只会重复计算 overlap 区间。正确口径是分别分析 FSDP 和 all2all 的瓶颈，然后用 `max(FSDP, compute + all2all)` 合成 E2E。
 
 可以在汇报中写成：
 
