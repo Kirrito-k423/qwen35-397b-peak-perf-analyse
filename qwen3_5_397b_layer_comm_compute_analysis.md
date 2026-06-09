@@ -373,11 +373,70 @@ Bytes_layer_ep16 = P_fsdp_ep16 * 2
 Qwen3.5-397B-A17B 全局平均每层参数量约 6.57G；但在 EP16 下，单个 EP rank 的 FSDP AllGather 参数量约 0.532G，bf16 通信负载约 1.064GB。
 ```
 
-## 5. SP16 / USP all-to-all 激活通信
+## 5. EP16 MoE all2all 通信负载
+
+除了 FSDP 参数 AllGather，MoE 在 EP 并行下还需要 token dispatch / combine 通信。代码实现中通常表现为 expert 前后的 `permute / unpermute`，底层是 EP group 内的 all2all 或 all2allv。
+
+这里先给理论下界口径：只计算本 rank 需要发送到其他 EP rank 的 hidden states，不把本地留存的 `1/EP` 计入网络发送量，也不额外乘 pack/unpack、send/recv staging 的 memcpy 次数。
+
+每个 token 激活 `top_k = 10` 个 experts，因此单次 dispatch 需要路由的 hidden state 元素量为：
+
+```text
+Elements_dispatch_total = S_local * top_k * hidden_size
+                        = 16,384 * 10 * 4096
+                        = 671,088,640 elements
+```
+
+bf16 字节数：
+
+```text
+Bytes_dispatch_total = 671,088,640 * 2
+                     = 1,342,177,280 bytes
+                     = 1.342 GB
+```
+
+EP16 中本 rank 约有 `1/16` 留在本地，发给其他 `15` 个 EP rank 的 remote-send 通信量为：
+
+```text
+Bytes_dispatch_remote = Bytes_dispatch_total * (EP - 1) / EP
+                      = 1.342GB * 15 / 16
+                      = 1.258GB
+```
+
+一次 MoE 层既有 dispatch，也有 combine，因此单层 EP all2all 理论 remote-send 通信量为：
+
+```text
+Bytes_EP_all2all_layer = 2 * Bytes_dispatch_remote
+                       = 2 * 1.258GB
+                       = 2.517GB / layer
+```
+
+对应 12 层 profiling 窗口：
+
+```text
+Bytes_EP_all2all_12 = 12 * 2.517GB
+                    = 30.199GB
+```
+
+按 A3 有效通信带宽 `159GB/s` 估算：
+
+```text
+T_EP_all2all_A3_layer = 2.517GB / 159GB/s
+                      = 15.8ms / layer
+
+T_EP_all2all_A3_12 = 30.199GB / 159GB/s
+                   = 189.9ms / 12 layers
+```
+
+这个理论值与 profiling 拆分出的 EP all2all `300ms(memcpy 207ms)` 对齐关系较好：memcpy `207ms` 接近理论 `189.9ms`，wall time `300ms` 主要多出约 `93ms` 等待/调度。
+
+注意：这个公式使用 `hidden_size = 4096`，不是 `moe_intermediate_size = 1024`。原因是 EP dispatch/combine 搬运的是 token hidden state；`moe_intermediate_size=1024` 影响的是 expert 内部 `gate/up/down` 参数和 GEMM，不直接让 dispatch hidden state 小 4 倍。
+
+## 6. SP16 / USP all-to-all 激活通信
 
 除了 FSDP 参数 AllGather，代码中还存在 USP 的序列并行 all-to-all 激活通信。
 
-### 5.1 代码依据
+### 6.1 代码依据
 
 `xtuner/v1/module/attention/mha.py` 中，full attention 路径在 `seq_ctx.sequence_parallel_mesh.size() > 1` 时：
 
@@ -404,13 +463,13 @@ core_attn_out = _all_to_all_out(...)
 
 也就是 linear attention 每层有 6 次 USP all-to-all：`Q`、`K`、`V`、`g`、`beta`、`O`。
 
-### 5.2 all-to-all 通信口径
+### 6.2 all-to-all 通信口径
 
 `ulysses_all_to_all` 的实现对输入 tensor 做 all-to-all single。本文采用与前面通信估算一致的“逻辑 payload”口径：每次 all-to-all 的通信负载按输入 tensor 的 bf16 字节数估算。
 
 严格按网络发送字节算，all-to-all 中每个 rank 只发送 `(SP-1)/SP` 的本地 tensor 给其他 rank；`SP=16` 时发送字节约为逻辑 payload 的 `15/16`。由于这里还要和 FSDP AllGather 示例口径对齐，主表使用逻辑 payload，并在备注中说明发送字节修正。
 
-### 5.3 Full attention USP 通信量
+### 6.3 Full attention USP 通信量
 
 full attention 路径中：
 
@@ -446,7 +505,7 @@ Bytes_USP_full = Bytes_Q_full + Bytes_K_full + Bytes_V_full + Bytes_O_full
                = 0.805 GB
 ```
 
-### 5.4 Linear attention / GatedDeltaNet USP 通信量
+### 6.4 Linear attention / GatedDeltaNet USP 通信量
 
 linear attention 配置：
 
@@ -508,7 +567,7 @@ Bytes_USP_linear = Bytes_Q_linear
                  = 0.675 GB
 ```
 
-### 5.5 平均单层 USP 通信量
+### 6.5 平均单层 USP 通信量
 
 Qwen3.5-397B-A17B 每 4 层中 1 层 full attention、3 层 linear attention，因此平均单层 USP all-to-all 逻辑 payload：
 
@@ -528,7 +587,7 @@ Bytes_USP_avg_send = Bytes_USP_avg * (SP - 1) / SP
                    = 0.664 GB
 ```
 
-### 5.6 参数通信 + USP 激活通信合计
+### 6.6 参数通信 + USP 激活通信合计
 
 主表使用逻辑 payload 口径：
 
@@ -545,11 +604,11 @@ Bytes_comm_total = Bytes_layer_ep16 + Bytes_USP_avg
 按源码 tensor shape 估算，在 EP16 + SP16 下，平均单层通信逻辑 payload 约为 1.772GB，其中 FSDP 参数 AllGather 约 1.064GB，USP all-to-all 激活通信约 0.708GB。
 ```
 
-## 6. 单层 active 计算量推导
+## 7. 单层 active 计算量推导
 
 计算量需要使用 active 参数，而不是全量参数。MoE 中每个 token 只激活 `top_k = 10` 个 routed experts，同时始终计算 shared expert、router 和 attention。
 
-### 6.1 Active routed experts 参数量
+### 7.1 Active routed experts 参数量
 
 ```text
 P_routed_active = K * P_expert
@@ -557,7 +616,7 @@ P_routed_active = K * P_expert
                 = 125,829,120 params
 ```
 
-### 6.2 Full attention 层 active 参数量
+### 7.2 Full attention 层 active 参数量
 
 ```text
 P_active_full = P_routed_active
@@ -577,7 +636,7 @@ P_active_full = P_routed_active
               = 245,379,584 params
 ```
 
-### 6.3 Linear attention 层 active 参数量
+### 7.3 Linear attention 层 active 参数量
 
 ```text
 P_active_linear = P_routed_active
@@ -605,7 +664,7 @@ P_active_avg = (1 * P_active_full + 3 * P_active_linear) / 4
              = 255,246,656 params
 ```
 
-### 6.4 GEMM 计算量
+### 7.4 GEMM 计算量
 
 对线性层，矩阵乘通常按 `2 FLOPs / parameter / token` 估算。
 
@@ -626,7 +685,7 @@ F_gemm_avg = 2 * S_local * P_active_avg
            = 8.36 TFlops
 ```
 
-### 6.5 Full attention 二次项
+### 7.5 Full attention 二次项
 
 full attention 每 4 层出现一次。对 full attention 的 `QK^T` 和 `AV` 二次项，粗略按：
 
@@ -658,9 +717,9 @@ F_total_avg = F_gemm_avg + F_attn_quad_avg
 以 16k local sequence length 为 base，Qwen3.5-397B-A17B 平均每层 active GEMM 计算量约 8.36TFlops；如果计入 full attention 二次项，平均每层约 10.56TFlops。
 ```
 
-## 7. 耗时预测公式
+## 8. 耗时预测公式
 
-### 7.1 通信耗时
+### 8.1 通信耗时
 
 通信耗时使用：
 
@@ -675,7 +734,16 @@ H800 effective BW = 4.6GB / 0.115s = 40.0 GB/s
 A3 effective BW   = 4.6GB / 0.029s = 158.6 GB/s，近似取 159 GB/s
 ```
 
-Qwen3.5 在 `EP16` 后单 rank FSDP AllGather 通信负载为 `1.064GB`，USP all-to-all 平均激活通信逻辑 payload 为 `0.708GB`，合计通信逻辑 payload 为 `1.772GB`。对应理论通信耗时为：
+Qwen3.5 在 `EP16 + SP16` 下，单层通信拆成三部分：
+
+```text
+FSDP 参数 AllGather：1.064GB / layer
+EP MoE all2all dispatch+combine：2.517GB / layer
+SP USP all-to-all：0.708GB / layer
+总通信：4.289GB / layer
+```
+
+对应理论通信耗时为：
 
 ```text
 T_fsdp_H800 = 1.064GB / 40.0GB/s
@@ -684,8 +752,11 @@ T_fsdp_H800 = 1.064GB / 40.0GB/s
 T_usp_H800 = 0.708GB / 40.0GB/s
            = 18ms
 
-T_comm_total_H800 = 1.772GB / 40.0GB/s
-                  = 44ms
+T_ep_all2all_H800 = 2.517GB / 40.0GB/s
+                  = 63ms
+
+T_comm_total_H800 = 4.289GB / 40.0GB/s
+                  = 107ms
 
 T_fsdp_A3 = 1.064GB / 159GB/s
           = 7ms
@@ -693,11 +764,14 @@ T_fsdp_A3 = 1.064GB / 159GB/s
 T_usp_A3 = 0.708GB / 159GB/s
          = 4ms
 
-T_comm_total_A3 = 1.772GB / 159GB/s
-                = 11ms
+T_ep_all2all_A3 = 2.517GB / 159GB/s
+                = 16ms
+
+T_comm_total_A3 = 4.289GB / 159GB/s
+                = 27ms
 ```
 
-### 7.2 计算耗时
+### 8.2 计算耗时
 
 计算耗时使用：
 
@@ -746,17 +820,18 @@ T_compute_A3_total = 10.56T / 152.0T/s
                    = 69ms
 ```
 
-## 8. 最终预测表
+## 9. 最终预测表
 
 | 项目 | H800 | A3 超节点 |
 |---|---:|---:|
 | 1 层 FSDP 参数 AllGather，EP16 后单 rank 参数 | 27 ms | 7 ms |
+| 1 层 EP MoE all2all，dispatch + combine | 63 ms | 16 ms |
 | 1 层 USP all-to-all 激活通信，SP16 平均层 | 18 ms | 4 ms |
-| 1 层总通信，FSDP + USP | 44 ms | 11 ms |
+| 1 层总通信，FSDP + EP all2all + USP | 107 ms | 27 ms |
 | 1 层 16k 序列计算，只计 active GEMM | 28 ms | 55 ms |
 | 1 层 16k 序列计算，计入 full-attn 平均二次项 | 36 ms | 69 ms |
 
-## 9. Profiling 校准与解释建议
+## 10. Profiling 校准与解释建议
 
 用户提供的 profiling 汇总窗口为 12 层：
 
@@ -775,7 +850,7 @@ all2all 通信 wall time：1297 ms，其中实际 memcpy：231 ms
   - SP all2all wall time：990 ms，其中实际 memcpy：30 ms
 ```
 
-### 9.1 12 层理论值
+### 10.1 12 层理论值
 
 按本文 A3 理论模型：
 
@@ -794,8 +869,8 @@ T_fsdp_theory_12 = 12 * 1.064GB / 159GB/s
 T_usp_theory_12 = 12 * 0.708GB / 159GB/s
                 = 53.4 ms
 
-T_comm_theory_12 = 80.3 + 53.4
-                 = 133.7 ms
+T_fsdp_usp_theory_12 = 80.3 + 53.4
+                     = 133.7 ms
 ```
 
 注意：上述 `T_usp_theory_12` 是源码 tensor shape 的粗估，用来给出 SP attention all-to-all 的量级；它没有把 EP 前后 `permute / unpermute` 的 all2allv profiling 事件直接折算成理论通信量。EP all2allv 的 profiling size 需要先确认单位、per-peer 还是聚合、是否包含 pack/unpack 和 send/recv 两侧 memcpy，再单独建模。
@@ -807,6 +882,9 @@ T_ep_all2all_theory_12
   = 12 * 2 * S_local * top_k * hidden_size * 2 bytes * (EP - 1) / EP / 159GB/s
   = 12 * 2 * 16,384 * 10 * 4096 * 2 * 15 / 16 / 159GB/s
   = 189.9 ms
+
+T_comm_theory_12_with_ep = 80.3 + 53.4 + 189.9
+                         = 323.6 ms
 ```
 
 12 层理论计算耗时：
@@ -823,7 +901,7 @@ T_full_attn_quad_A3 = 8.796TFlops / 152TFlops/s
                     = 57.9 ms
 ```
 
-### 9.2 实测与理论对比
+### 10.2 实测与理论对比
 
 | 项目 | 理论耗时 | 实际 memcpy | 实际 wall time | memcpy / 理论 | wall / 理论 | 等待/调度耗时 | 等待占 wall |
 |---|---:|---:|---:|---:|---:|---:|---:|
@@ -853,7 +931,7 @@ all2all 拆成 EP 与 SP 分别看：
 | 12 层计算，计入 full-attn 二次项 | 833.9 ms | 1102 ms | 1.32x |
 | 单次 full attention 二次项 | 57.9 ms | 82 ms | 1.42x |
 
-### 9.3 建议解释口径
+### 10.3 建议解释口径
 
 这组 profiling 可以支持如下判断：
 
@@ -871,9 +949,21 @@ all2all 拆成 EP 与 SP 分别看：
 计算侧只计 active GEMM 时，实测应扣除 3 次 full attention，即 1102 - 82 * 3 = 856ms，对比理论 660ms，约为 1.30x。若计入 full attention 二次项，总计算理论为 834ms，12 层实测 1102ms，约为 1.32x。单次 full attention 实测约 82ms，对比二次项理论 58ms，约为 1.42x。
 ```
 
-## 10. 可引用结论
+## 11. 可引用结论
 
-Qwen3.5-397B-A17B 全局平均每层参数量约为 `6.57G params`。但在 `EP16` 下，512 个 routed experts 被切成每个 EP rank 只持有 `32` 个 experts，因此单 rank 每层 FSDP AllGather 参数量约为 `0.532G params`，bf16 参数通信负载约为 `1.064GB`。此外，代码中的 USP 会在 `SP16` 下引入 attention 激活 all-to-all，按源码 tensor shape 粗估平均每层逻辑 payload 约为 `0.708GB`。因此平均每层 `FSDP + USP` 通信逻辑 payload 约为 `1.772GB`。
+Qwen3.5-397B-A17B 全局平均每层参数量约为 `6.57G params`。但在 `EP16` 下，512 个 routed experts 被切成每个 EP rank 只持有 `32` 个 experts，因此单 rank 每层 FSDP AllGather 参数量约为 `0.532G params`，bf16 参数通信负载约为 `1.064GB`。
+
+MoE 的 EP dispatch/combine 还会引入 EP all2all。按 remote-send 下界估算，单层 EP all2all 通信量为：
+
+```text
+2 * 16,384 * 10 * 4096 * 2 * 15 / 16 = 2.517GB / layer
+```
+
+此外，代码中的 USP 会在 `SP16` 下引入 attention 激活 all-to-all，按源码 tensor shape 粗估平均每层逻辑 payload 约为 `0.708GB`。因此平均每层 `FSDP + EP all2all + USP` 通信逻辑 payload 约为：
+
+```text
+1.064GB + 2.517GB + 0.708GB = 4.289GB / layer
+```
 
 profiling 中还观测到 EP 前后 `permute / unpermute` 的 all2allv，以及 linear attention SP 的细粒度 memcpy size。这些数据说明 all2all 实测中存在额外的 pack/unpack、per-peer chunk、send/recv 和等待同步开销；但在确认 profiler size 的单位和聚合口径前，不应把这些 memcpy size 直接当作网络理论通信量。
 
@@ -881,16 +971,16 @@ profiling 中还观测到 EP 前后 `permute / unpermute` 的 all2allv，以及 
 
 假设通信带宽与 Qwen3 235B 示例一致，即 H800 有效通信带宽约 `40GB/s`、A3 超节点有效通信带宽约 `159GB/s`，并假设 H800 BF16 MFU 为 `0.3`、A3 BF16 MFU 为 `0.4`，则预测：
 
-| 芯片 | 1 层 FSDP 参数通信 | 1 层 USP 激活通信 | 1 层 FSDP+USP 通信 | 1 层 16k 序列计算 |
-|---|---:|---:|---:|---:|
-| H800 | 27 ms | 18 ms | 44 ms | 28 ms GEMM / 36 ms 含 full-attn 二次项 |
-| A3 超节点 | 7 ms | 4 ms | 11 ms | 55 ms GEMM / 69 ms 含 full-attn 二次项 |
+| 芯片 | 1 层 FSDP 参数通信 | 1 层 EP all2all | 1 层 USP 激活通信 | 1 层总通信 | 1 层 16k 序列计算 |
+|---|---:|---:|---:|---:|---:|
+| H800 | 27 ms | 63 ms | 18 ms | 107 ms | 28 ms GEMM / 36 ms 含 full-attn 二次项 |
+| A3 超节点 | 7 ms | 16 ms | 4 ms | 27 ms | 55 ms GEMM / 69 ms 含 full-attn 二次项 |
 
-## 11. 备注和不确定项
+## 12. 备注和不确定项
 
 1. 本文通信负载按 `EP16` 后单 EP rank 的 FSDP 参数 AllGather 估算，即 routed experts 只计 `512 / 16 = 32` 个本地 experts。全局 `6.57G params/layer` 只用于说明模型层规模，不用于通信耗时。
 2. 本文没有再扣除 FSDP 分片局部已持有参数，也没有加入 ring allgather 链路放大系数；这是为了与用户给出的 Qwen3 235B 示例口径尽量保持一致。
 3. 日志中实际 `ep_size=8`，用户目标为 `ep16`。本文最终表按用户目标 `ep16_sp16` 的 local sequence 和参数通信口径计算；如果要精确模拟日志配置，需要按 `ep8_sp16` 重新分析专家切分和通信域。
-4. profiling 中的 EP all2allv 和 linear attention SP memcpy size 暂作为实测解释材料，不直接作为最终理论通信量；需要确认 profiler size 是 bytes 还是 bf16 elements、是 per-peer chunk 还是聚合量、是否包含 pack/unpack 和 send/recv 两侧 memcpy。
+4. EP all2all 理论值按 remote-send 下界估算，profiling 中更细的 EP all2allv memcpy size 暂作为实测解释材料；若要用 memcpy size 反推理论通信，需要确认 profiler size 是 bytes 还是 bf16 elements、是 per-peer chunk 还是聚合量、是否包含 pack/unpack 和 send/recv 两侧 memcpy。
 5. full attention 二次项按标准 `QK^T + AV` 粗略估算，实际 FA kernel、mask、MTP、重计算、overlap、EP dispatch/combine 通信都会影响真实耗时。
-6. 本文未计 optimizer、activation checkpoint、MoE token dispatch/combine 的计算开销、load balance、MTP 层和视觉塔计算，仅聚焦语言模型单 decoder layer 的参数 AllGather、USP attention 激活 all-to-all 和主计算。
+6. 本文未计 optimizer、activation checkpoint、MoE token dispatch/combine 的计算开销、load balance、MTP 层和视觉塔计算，仅聚焦语言模型单 decoder layer 的参数 AllGather、EP all2all、USP attention 激活 all-to-all 和主计算。
