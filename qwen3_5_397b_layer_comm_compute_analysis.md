@@ -820,6 +820,48 @@ T_compute_A3_total = 10.56T / 152.0T/s
                    = 69ms
 ```
 
+### 8.3 端到端 overlap 口径
+
+端到端耗时不能把 FSDP、all2all 和计算简单相加。当前训练流水中更合理的近似是：
+
+```text
+T_e2e = max(T_fsdp, T_compute + T_all2all)
+```
+
+其中：
+
+- `T_fsdp`：FSDP 参数 AllGather，通常可以和计算段 overlap。
+- `T_all2all`：EP all2all + SP all-to-all，通常位于 MoE/attention 数据重排关键路径上，不能被同层计算完全掩盖。
+- `T_compute`：该层主要计算耗时。
+
+因此单层 A3 理论估算应为：
+
+```text
+T_fsdp_A3 = 7ms
+T_all2all_A3 = T_ep_all2all_A3 + T_usp_A3 = 16ms + 4ms = 20ms
+
+只计 active GEMM:
+T_e2e_A3 = max(7, 55 + 20) = 75ms
+
+计入 16k full-attn 二次项:
+T_e2e_A3 = max(7, 69 + 20) = 89ms
+```
+
+H800：
+
+```text
+T_fsdp_H800 = 27ms
+T_all2all_H800 = 63ms + 18ms = 81ms
+
+只计 active GEMM:
+T_e2e_H800 = max(27, 28 + 81) = 109ms
+
+计入 16k full-attn 二次项:
+T_e2e_H800 = max(27, 36 + 81) = 117ms
+```
+
+如果使用 TND / varlen FA 的平均序列长度修正，则 `T_compute` 应替换为第 10.0 节中的 `1k/2k` 口径，FSDP overlap 公式不变。
+
 ## 9. 最终预测表
 
 | 项目 | H800 | A3 超节点 |
@@ -827,9 +869,11 @@ T_compute_A3_total = 10.56T / 152.0T/s
 | 1 层 FSDP 参数 AllGather，EP16 后单 rank 参数 | 27 ms | 7 ms |
 | 1 层 EP MoE all2all，dispatch + combine | 63 ms | 16 ms |
 | 1 层 USP all-to-all 激活通信，SP16 平均层 | 18 ms | 4 ms |
-| 1 层总通信，FSDP + EP all2all + USP | 107 ms | 27 ms |
+| 1 层 all2all，EP + USP，不可被计算掩盖 | 81 ms | 20 ms |
 | 1 层 16k 序列计算，只计 active GEMM | 28 ms | 55 ms |
 | 1 层 16k 序列计算，计入 full-attn 平均二次项 | 36 ms | 69 ms |
+| 1 层 E2E，`max(FSDP, GEMM + all2all)` | 109 ms | 75 ms |
+| 1 层 E2E，`max(FSDP, compute_with_full_attn + all2all)` | 117 ms | 89 ms |
 
 ## 10. Profiling 校准与解释建议
 
@@ -1042,12 +1086,21 @@ all2all 拆成 EP 与 SP 分别看：
 2. FSDP 参数通信单独看，实际 memcpy 是理论的 `3.80x`，wall time 是理论的 `31.17x`，说明 FSDP 侧既有 memcpy/带宽差距，也有严重等待。
 3. EP all2all 的 memcpy `207ms` 接近理论 `190ms`，wall time `300ms`，说明 EP all2all 主要差距不是 memcpy 带宽，而是约 `93ms` 的等待/调度。
 4. SP all2all 的 memcpy 只有 `30ms`，但 wall time 达到 `990ms`，wall/memcpy 为 `33x`，等待占比约 `97%`。因此 SP all2all 的主要问题是快慢卡等待、collective 同步、SP 组内 straggler 或 overlap 不充分，而不是纯 memcpy。
-5. 通信合计 wall time 相比 memcpy 是 `7.00x`，额外 `3251ms` 主要来自等待/同步，而不是纯 memcpy。
+5. FSDP 通信基本可以和计算段 overlap，但 all2all 不能被计算掩盖。因此 12 层 E2E 不应写成 `FSDP + all2all + compute`，而应写成：
+
+```text
+T_e2e_12 = max(T_fsdp, T_compute + T_all2all)
+         = max(2503, 1102 + 1297)
+         = max(2503, 2399)
+         = 2503ms
+```
+
+6. 通信合计 wall time 相比 memcpy 是 `7.00x`，额外 `3251ms` 主要来自等待/同步；但这些等待不应全部与计算串行相加，需要按上述 overlap 公式进入 E2E。
 
 可以在汇报中写成：
 
 ```text
-在 12 层 profiling 中，FSDP 参数通信理论约 80ms，实际 memcpy 为 305ms，约为理论的 3.8x；FSDP wall time 为 2503ms，约为理论的 31.2x。all2all 需要拆开看：EP all2all 理论约 190ms，memcpy 207ms，wall 300ms，基本接近理论；SP all2all 理论约 53ms，memcpy 30ms，但 wall 990ms，wall/memcpy 达到 33x，等待占比约 97%。因此通信 wall time 的主要膨胀来自 FSDP 等待和 SP all2all 等待，而不是 EP all2all memcpy 本身。
+在 12 层 profiling 中，FSDP 参数通信理论约 80ms，实际 memcpy 为 305ms，约为理论的 3.8x；FSDP wall time 为 2503ms，约为理论的 31.2x。all2all 需要拆开看：EP all2all 理论约 190ms，memcpy 207ms，wall 300ms，基本接近理论；SP all2all 理论约 53ms，memcpy 30ms，但 wall 990ms，wall/memcpy 达到 33x，等待占比约 97%。端到端耗时应按 max(FSDP, compute + all2all) 理解，即 max(2503, 1102 + 1297) = 2503ms，而不是把 FSDP、all2all、compute 全部相加。
 
 计算侧只计 active GEMM 时，实测应扣除 3 次 full attention，即 1102 - 82 * 3 = 856ms，对比理论 660ms，约为 1.30x。若计入 full attention 二次项，总计算理论为 834ms，12 层实测 1102ms，约为 1.32x。单次 full attention 实测约 82ms，对比二次项理论 58ms，约为 1.42x。
 ```
@@ -1074,10 +1127,10 @@ profiling 中还观测到 EP 前后 `permute / unpermute` 的 all2allv，以及 
 
 假设通信带宽与 Qwen3 235B 示例一致，即 H800 有效通信带宽约 `40GB/s`、A3 超节点有效通信带宽约 `159GB/s`，并假设 H800 BF16 MFU 为 `0.3`、A3 BF16 MFU 为 `0.4`，则预测：
 
-| 芯片 | 1 层 FSDP 参数通信 | 1 层 EP all2all | 1 层 USP 激活通信 | 1 层总通信 | 1 层 16k 序列计算 |
-|---|---:|---:|---:|---:|---:|
-| H800 | 27 ms | 63 ms | 18 ms | 107 ms | 28 ms GEMM / 36 ms 含 full-attn 二次项 |
-| A3 超节点 | 7 ms | 16 ms | 4 ms | 27 ms | 55 ms GEMM / 69 ms 含 full-attn 二次项 |
+| 芯片 | 1 层 FSDP 参数通信 | 1 层 EP all2all | 1 层 USP 激活通信 | 1 层 all2all | 1 层 16k 计算 | 1 层 E2E `max(FSDP, compute+all2all)` |
+|---|---:|---:|---:|---:|---:|---:|
+| H800 | 27 ms | 63 ms | 18 ms | 81 ms | 28 ms GEMM / 36 ms 含 full-attn 二次项 | 109 ms GEMM / 117 ms 含 full-attn |
+| A3 超节点 | 7 ms | 16 ms | 4 ms | 20 ms | 55 ms GEMM / 69 ms 含 full-attn 二次项 | 75 ms GEMM / 89 ms 含 full-attn |
 
 ## 12. 备注和不确定项
 
