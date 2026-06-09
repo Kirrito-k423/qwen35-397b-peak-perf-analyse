@@ -770,7 +770,9 @@ T_compute_A3_total = 10.56T / 152.0T/s
 计算总耗时：1102 ms
 单次 full attention：约 82 ms
 FSDP 通信 wall time：2503 ms，其中实际 memcpy：305 ms
-USP/all2all 通信 wall time：1297 ms，其中实际 memcpy：231 ms
+all2all 通信 wall time：1297 ms，其中实际 memcpy：231 ms
+  - EP all2all wall time：300 ms，其中实际 memcpy：207 ms
+  - SP all2all wall time：990 ms，其中实际 memcpy：30 ms
 ```
 
 ### 9.1 12 层理论值
@@ -798,6 +800,15 @@ T_comm_theory_12 = 80.3 + 53.4
 
 注意：上述 `T_usp_theory_12` 是源码 tensor shape 的粗估，用来给出 SP attention all-to-all 的量级；它没有把 EP 前后 `permute / unpermute` 的 all2allv profiling 事件直接折算成理论通信量。EP all2allv 的 profiling size 需要先确认单位、per-peer 还是聚合、是否包含 pack/unpack 和 send/recv 两侧 memcpy，再单独建模。
 
+EP all2all 的理论期望按 MoE dispatch/combine 的 remote send 下界估算：
+
+```text
+T_ep_all2all_theory_12
+  = 12 * 2 * S_local * top_k * hidden_size * 2 bytes * (EP - 1) / EP / 159GB/s
+  = 12 * 2 * 16,384 * 10 * 4096 * 2 * 15 / 16 / 159GB/s
+  = 189.9 ms
+```
+
 12 层理论计算耗时：
 
 ```text
@@ -818,12 +829,21 @@ T_full_attn_quad_A3 = 8.796TFlops / 152TFlops/s
 |---|---:|---:|---:|---:|---:|---:|---:|
 | FSDP 参数通信，12 层 | 80.3 ms | 305 ms | 2503 ms | 3.80x | 31.17x | 2198 ms | 87.8% |
 
-all2all 部分先不强行给理论倍率，只做实测拆解：
+all2all 拆成 EP 与 SP 分别看：
 
-| 项目 | 实际 memcpy | 实际 wall time | wall / memcpy | 等待/调度耗时 | 等待占 wall |
-|---|---:|---:|---:|---:|---:|
-| EP + SP all2all，12 层 | 231 ms | 1297 ms | 5.61x | 1066 ms | 82.2% |
-| 通信合计，12 层 | 536 ms | 3800 ms | 7.09x | 3264 ms | 85.9% |
+| 项目 | 理论耗时 | 实际 memcpy | 实际 wall time | memcpy / 理论 | wall / 理论 | wall / memcpy | 等待/调度耗时 | 等待占 wall |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|
+| EP all2all，12 层 | 189.9 ms | 207 ms | 300 ms | 1.09x | 1.58x | 1.45x | 93 ms | 31.0% |
+| SP all2all，12 层 | 53.4 ms | 30 ms | 990 ms | 0.56x | 18.53x | 33.00x | 960 ms | 97.0% |
+| EP + SP all2all，12 层 | 243.3 ms | 237 ms | 1290 ms | 0.97x | 5.30x | 5.44x | 1053 ms | 81.6% |
+
+注：用户给出的 all2all 总数为 `1297ms(memcpy 231ms)`，EP/SP 拆分相加为 `1290ms(memcpy 237ms)`，存在少量 profiling 分类或四舍五入口径差异。下面的归因分析按 EP/SP 拆分项判断瓶颈。
+
+通信合计按 FSDP + EP all2all + SP all2all 拆分：
+
+| 项目 | 理论耗时 | 实际 memcpy | 实际 wall time | memcpy / 理论 | wall / 理论 | wall / memcpy | 等待/调度耗时 | 等待占 wall |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|
+| FSDP + EP all2all + SP all2all，12 层 | 323.6 ms | 542 ms | 3793 ms | 1.68x | 11.72x | 7.00x | 3251 ms | 85.7% |
 
 计算部分：
 
@@ -839,14 +859,14 @@ all2all 部分先不强行给理论倍率，只做实测拆解：
 
 1. 计算侧相对理论值的差距在 `1.3x` 左右，属于 MFU、kernel 实现、linear attention kernel、重计算和调度开销共同造成的范围。只计 active GEMM 时，应从 12 层总计算中扣除 3 次 full attention，即 `1102 - 82 * 3 = 856ms`，约为理论的 `1.30x`；若采用“计入 full-attn 二次项”的总计算口径，12 层实测为理论的 `1.32x`。
 2. FSDP 参数通信单独看，实际 memcpy 是理论的 `3.80x`，wall time 是理论的 `31.17x`，说明 FSDP 侧既有 memcpy/带宽差距，也有严重等待。
-3. all2all 部分暂不直接和源码 shape 理论值做倍率比较，因为 profiling 中 EP permute/unpermute 的 all2allv、SP attention all-to-all、per-peer chunk、send/recv 和 pack/unpack 口径尚未完全对齐。
-4. all2all 的 wall time 是 memcpy 的 `5.61x`，等待占比 `82.2%`。因此 all2all 主要问题不是 memcpy 本身，而是快慢卡等待、collective 同步、EP token 不均衡、SP/EP 组内 straggler 和 overlap 不充分。
-5. 通信合计 wall time 相比 memcpy 是 `7.09x`，额外 `3264ms` 主要来自等待/同步，而不是纯 memcpy。
+3. EP all2all 的 memcpy `207ms` 接近理论 `190ms`，wall time `300ms`，说明 EP all2all 主要差距不是 memcpy 带宽，而是约 `93ms` 的等待/调度。
+4. SP all2all 的 memcpy 只有 `30ms`，但 wall time 达到 `990ms`，wall/memcpy 为 `33x`，等待占比约 `97%`。因此 SP all2all 的主要问题是快慢卡等待、collective 同步、SP 组内 straggler 或 overlap 不充分，而不是纯 memcpy。
+5. 通信合计 wall time 相比 memcpy 是 `7.00x`，额外 `3251ms` 主要来自等待/同步，而不是纯 memcpy。
 
 可以在汇报中写成：
 
 ```text
-在 12 层 profiling 中，FSDP 参数通信理论约 80ms，实际 memcpy 为 305ms，约为理论的 3.8x；FSDP wall time 为 2503ms，约为理论的 31.2x。all2all 部分先按实测拆解：memcpy 为 231ms，wall time 为 1297ms，wall/memcpy 为 5.61x，等待占比 82.2%。通信合计 memcpy 为 536ms，wall time 为 3800ms，额外的 3264ms 主要来自快慢卡等待、collective 同步和 overlap 不充分，而不是纯 memcpy 带宽本身。
+在 12 层 profiling 中，FSDP 参数通信理论约 80ms，实际 memcpy 为 305ms，约为理论的 3.8x；FSDP wall time 为 2503ms，约为理论的 31.2x。all2all 需要拆开看：EP all2all 理论约 190ms，memcpy 207ms，wall 300ms，基本接近理论；SP all2all 理论约 53ms，memcpy 30ms，但 wall 990ms，wall/memcpy 达到 33x，等待占比约 97%。因此通信 wall time 的主要膨胀来自 FSDP 等待和 SP all2all 等待，而不是 EP all2all memcpy 本身。
 
 计算侧只计 active GEMM 时，实测应扣除 3 次 full attention，即 1102 - 82 * 3 = 856ms，对比理论 660ms，约为 1.30x。若计入 full attention 二次项，总计算理论为 834ms，12 层实测 1102ms，约为 1.32x。单次 full attention 实测约 82ms，对比二次项理论 58ms，约为 1.42x。
 ```
