@@ -833,6 +833,109 @@ T_compute_A3_total = 10.56T / 152.0T/s
 
 ## 10. Profiling 校准与解释建议
 
+### 10.0 TND / varlen FA 与 MoE 负载不均衡
+
+当前 profiling 需要特别注意两个会改变“理论 vs 实测”解释的因素：
+
+1. full attention 使用 TND / varlen 数据时，虽然单 die 总 token 数是 `16k`，但 attention 二次项不一定按 `16k^2` 计算。
+2. MoE 如果路由负载不均衡，EP all2all 和 expert GEMM 的 wall time 会由最慢 rank 决定，而不是由平均 token 数决定。
+
+#### TND / varlen FA 的二次项
+
+前文 full attention 二次项使用的是最保守的单段长序列估算：
+
+```text
+F_attn_quad_full = 4 * S_local^2 * num_heads * head_dim
+                 = 4 * 16,384^2 * 32 * 256
+                 = 8.80TFlops / full-attention layer
+```
+
+这等价于假设一个 rank 上的 `16k` token 属于同一条连续序列。但 TND / varlen FA 通常按多条样本的真实长度分别计算 attention，二次项应为：
+
+```text
+F_attn_quad_varlen = 4 * sum_i(seq_i^2) * num_heads * head_dim
+```
+
+如果总 token 数固定为：
+
+```text
+S_total = sum_i(seq_i) = 16,384
+```
+
+且平均序列长度约为 `L_avg`，则在长度比较均匀时：
+
+```text
+sum_i(seq_i^2) ~= S_total * L_avg
+```
+
+因此：
+
+```text
+F_attn_quad_varlen ~= 4 * S_total * L_avg * num_heads * head_dim
+```
+
+与单段 16k 序列相比，缩放因子约为：
+
+```text
+F_varlen / F_16k ~= L_avg / S_total
+```
+
+代入 `L_avg = 1k` 和 `2k`：
+
+| 平均序列长度 | full attention 二次项 / full layer | 相对 16k 单段 | A3 理论耗时，仅二次项 | 平均到每层后的额外计算 |
+|---:|---:|---:|---:|---:|
+| 16k | 8.80TFlops | 1.00x | 57.9 ms | 2.20TFlops |
+| 2k | 1.10TFlops | 0.125x | 7.2 ms | 0.275TFlops |
+| 1k | 0.55TFlops | 0.0625x | 3.6 ms | 0.137TFlops |
+
+所以，如果当前 profiling 的 TND 数据平均序列长度只有 `1k` 或 `2k`，full attention 的理论二次项应显著小于 `16k^2` 估算。对应平均单层计算量也应改为：
+
+```text
+L_avg = 2k: F_layer ~= 8.36 + 0.275 = 8.64TFlops / layer
+L_avg = 1k: F_layer ~= 8.36 + 0.137 = 8.50TFlops / layer
+```
+
+而不是使用 `10.56TFlops / layer`。这意味着如果实测 full attention 仍接近 `82ms`，它可能不只是纯 `QK^T + AV` 二次项，还包含 kernel 固定开销、TND packing/unpacking、调度等待、重计算、mask/metadata 处理，或 profiling 统计范围包含了 projection/同步等其他部分。
+
+#### MoE 负载不均衡的影响
+
+前文 EP all2all 和 MoE compute 的理论值默认负载均衡，即 token-expert assignment 在 EP ranks 上均匀分布。定义 EP rank 的负载为该 rank 实际收到的 token-expert 数：
+
+```text
+load_r = rank r 接收到的 token-expert 数
+load_avg = mean(load_r)
+load_max = max(load_r)
+rho = load_max / load_avg
+```
+
+如果 `rho > 1`，那么 MoE 相关 wall time 通常按最慢 rank 近似放大：
+
+```text
+T_moe_compute_wall ~= rho * T_moe_compute_avg
+T_ep_all2all_wall ~= rho_comm * T_ep_all2all_avg + sync_wait
+```
+
+这里 `rho_comm` 不一定等于 `rho`，因为 all2allv 还受消息大小分布、peer 分布、pack/unpack 和 HCCL 调度影响。负载不均衡会带来几类后果：
+
+- expert GEMM：重载 EP rank 的 expert GEMM 时间变长，其他 rank 等待。
+- EP all2allv：重载 rank 发送/接收 token 更多，all2allv 的最长路径变长。
+- FSDP / SP collective：后续 collective 需要等最慢 rank 到达，导致看起来像 FSDP 或 SP all2all 变慢。
+- overlap 失效：部分 rank 还在 MoE compute/dispatch，其他 rank 已进入通信，产生额外空等。
+
+因此 profiling 中如果看到 all2all 或 FSDP wall time 远大于 memcpy time，应进一步检查：
+
+```text
+max tokens per EP rank / avg tokens per EP rank
+max tokens per expert / avg tokens per expert
+各 rank 进入 collective 的时间差
+EP all2allv 每个 peer 的 send/recv size 分布
+```
+
+结论上应区分两件事：
+
+- 理论 payload 决定“最少要搬多少数据”。
+- 负载不均衡和 straggler 决定“所有 rank 等到通信完成要多久”。
+
 用户提供的 profiling 汇总窗口为 12 层：
 
 ```text
