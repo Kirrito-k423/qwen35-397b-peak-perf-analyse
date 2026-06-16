@@ -307,7 +307,13 @@ EP8PP1TP1
 
 ### 5.2 EP
 
-EP 增大会减少每 rank expert 参数和 expert compute，但会让 MoE dispatch/combine 的远端比例和 all2allv peer 数上升：
+EP 增大会减少每 rank expert 参数和 expert compute。对 MoE dispatch/combine 来说，如果总 token 数、`top_k` 和 hidden size 不变，需要搬运的逻辑 payload 基本不变：
+
+```text
+payload_total ~= tokens * top_k * hidden_size * bytes
+```
+
+但 EP 变大后，本地命中的比例下降，需要真正跨 rank 发送的远端比例会小幅上升：
 
 ```text
 EP4:  (EP - 1) / EP = 0.75
@@ -315,7 +321,19 @@ EP8:  0.875
 EP16: 0.9375
 ```
 
-对 A5/A3 单卡比值来说，减少计算、增加通信复杂度通常不是好方向。建议测试：
+所以从 EP8 到 EP16，远端 payload 不是翻倍，而是从 `87.5%` 到 `93.75%`，只增加约 `7.1%`。真正需要担心的是通信时间而不是总 bytes：EP 域变大后，all2allv 的 peer 数增加，chunk 更碎，调度/启动开销更多；同时 collective 要等更多 rank，MoE 路由不均、热 expert、慢 peer 造成 p95/p99 长尾的概率也更高。
+
+因此更精确地说：
+
+```text
+EP 增大:
+  通信 payload: 基本不变，远端比例小幅上升
+  通信时间: 可能上升，尤其 all2allv p95/p99
+  每 rank expert compute: 下降
+  comm/compute 比: 变差
+```
+
+对 A5/A3 单卡比值来说，减少计算但不等比例减少 MoE dispatch/combine 通信，通常不是好方向。建议测试：
 
 ```text
 EP4PP1TP2
@@ -333,8 +351,8 @@ EP4PP1TP1
 | 实验 | 目的 | 预期观察 |
 |---|---|---|
 | `EP8PP1TP1` | 去掉 TP2 固定通信税 | TP 通信下降，显存压力上升 |
-| `EP4PP1TP2` | 降低 EP all2allv peer 数 | MoE p95/p99 可能下降 |
-| `EP4PP1TP1` | 同时降低 TP/EP 通信 | 最符合 A5 甜点方向，但显存压力最大 |
+| `EP4PP1TP2` | 降低 EP all2allv peer 数和长尾风险 | MoE p95/p99 可能下降 |
+| `EP4PP1TP1` | 同时降低 TP 固定通信和 EP all2allv 复杂度 | 最符合 A5 甜点方向，但显存压力最大 |
 | `EP16PP1TP1` | 验证更大 EP 是否只是救显存 | 若 MoE 长尾变大，不适合追 A5/A3 比 |
 
 每个实验记录：
